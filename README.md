@@ -1,10 +1,10 @@
-Raphael: Multimodal AI Desktop Copilot
-專案簡介 (Project Overview)
+#Raphael: Multimodal AI Desktop Copilot
+#專案簡介 (Project Overview)
 Raphael (拉菲爾) 是一款次世代的智慧桌面助理，旨在重塑人機協作體驗。透過整合語音感官、視覺辨識與大型語言模型 (LLM)，Raphael 能像真人助手一樣「看見」你的螢幕、「聽懂」你的需求，並直接在你的電腦上執行複雜任務。
 
 Raphael is a next-generation AI desktop assistant designed to reshape the human-computer interaction experience. By integrating voice sensing, computer vision, and LLMs, Raphael can "see" your screen and "hear" your needs just like a human assistant.
 
-核心功能 (Key Features)
+#核心功能 (Key Features)
 語音交互 (Voice Interaction)：支援自定義喚醒詞（Raphael）與自然語言指令理解。
 
 視覺感知 (Vision Sensing)：利用 EasyOCR 與 GPT-4o 實現螢幕內容精確定位與點擊。
@@ -15,7 +15,7 @@ Raphael is a next-generation AI desktop assistant designed to reshape the human-
 
 科技感字幕 (Dynamic Subtitles)：即時顯示 AI 回饋文字，提供極佳的互動視覺體驗。
 
-技術架構 (Technical Architecture)
+#技術架構 (Technical Architecture)
 本專案採用多模態協作架構：
 
 Wake-word Detection: Picovoice Porcupine (Local Edge AI)
@@ -30,7 +30,7 @@ Action Execution: PyAutoGUI & Subprocess
 
 GUI Framework: PyQt5
 
-快速上手 (Quick Start)
+#快速上手 (Quick Start)
 1. 環境需求 (Prerequisites)
 Python 3.9+
 
