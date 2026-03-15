@@ -13,8 +13,8 @@ import requests
 import webbrowser
 import subprocess
 import urllib.parse
-import yt_dlp  # 用來搜尋與取得 YouTube 音訊串流
-import vlc     # python-vlc，用來播放音訊
+import yt_dlp
+import vlc 
 import psutil
 import pyautogui
 import pyperclip
@@ -59,14 +59,11 @@ if os.path.exists(APP_PATHS_FILE):
         print(f"[應用路徑載入失敗] {e}")
         app_paths = {}
 
-# 強制指定 VLC 安裝路徑（改成你實際的路徑！）
 vlc_install_path = r"C:\Program Files\VideoLAN\VLC"   # ← 這裡改成你的路徑
 
-# Python 3.8+ 推薦方式
 if hasattr(os, 'add_dll_directory'):
     os.add_dll_directory(vlc_install_path)
 
-# 強制載入 libvlc.dll 確認是否成功
 try:
     ctypes.CDLL(os.path.join(vlc_install_path, "libvlc.dll"))
     print(f"[VLC 載入成功] 從 {vlc_install_path} 載入 libvlc.dll")
@@ -85,9 +82,9 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 PICO_KEY = os.getenv("PICOVOICE_ACCESS_KEY")
 OWM_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 PPN_PATH = "Raphael.ppn"
-TEMPLATE_DIR = "templates"          # 模板資料夾
-DEFAULT_THRESHOLD = 0.73            # 基本門檻，視情況可調 0.68~0.80
-SCALES = [0.6, 0.8, 1.0, 1.2, 1.5]  # 多尺度範圍
+TEMPLATE_DIR = "templates"         
+DEFAULT_THRESHOLD = 0.73           
+SCALES = [0.6, 0.8, 1.0, 1.2, 1.5]
 
 def find_template(template_name, threshold=DEFAULT_THRESHOLD, scales=SCALES):
     """
