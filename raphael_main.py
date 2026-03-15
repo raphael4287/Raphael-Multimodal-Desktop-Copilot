@@ -6,66 +6,194 @@ import edge_tts
 import pygame
 import wave
 import struct
+import vlc
 import json
 import math
 import requests
 import webbrowser
 import subprocess
 import urllib.parse
+import yt_dlp  # 用來搜尋與取得 YouTube 音訊串流
+import vlc     # python-vlc，用來播放音訊
 import psutil
 import pyautogui
 import pyperclip
 import easyocr
+import cv2
 import numpy as np
 import sys
 import warnings
+import dateparser
 import time
 import base64
-import math
 import threading
-from PIL import Image 
+from PIL import Image
 from pvrecorder import PvRecorder
 from openai import OpenAI
 from dotenv import load_dotenv
 from io import BytesIO
-from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt5.QtGui import QFont, QColor, QPalette
 import ctypes
 ctypes.windll.shcore.SetProcessDpiAwareness(2)
+from PyQt5.QtWidgets import (
+    QMainWindow, QProgressBar, QTextEdit, QLineEdit,
+    QPushButton, QFrame, QSplitter, QHBoxLayout,
+    QVBoxLayout, QWidget, QLabel, QComboBox, QApplication
+)
+from PyQt5.QtCore import QTimer, pyqtSlot
+
+import queue
+speak_queue = queue.Queue()
+
+# ==================== 應用路徑記憶 ====================
+APP_PATHS_FILE = "app_paths.json"
+app_paths = {}
+
+if os.path.exists(APP_PATHS_FILE):
+    try:
+        with open(APP_PATHS_FILE, 'r', encoding='utf-8') as f:
+            app_paths = json.load(f)
+        print(f"[應用路徑] 已載入 {len(app_paths)} 個記住的應用/設定")
+    except Exception as e:
+        print(f"[應用路徑載入失敗] {e}")
+        app_paths = {}
+
+# 強制指定 VLC 安裝路徑（改成你實際的路徑！）
+vlc_install_path = r"C:\Program Files\VideoLAN\VLC"   # ← 這裡改成你的路徑
+
+# Python 3.8+ 推薦方式
+if hasattr(os, 'add_dll_directory'):
+    os.add_dll_directory(vlc_install_path)
+
+# 強制載入 libvlc.dll 確認是否成功
+try:
+    ctypes.CDLL(os.path.join(vlc_install_path, "libvlc.dll"))
+    print(f"[VLC 載入成功] 從 {vlc_install_path} 載入 libvlc.dll")
+except Exception as e:
+    print(f"[VLC 載入失敗] {e}")
+    print("請確認：")
+    print("1. VLC 已安裝在該路徑")
+    print("2. 路徑是否正確（包含大小寫）")
+    print("3. 是否安裝 64-bit VLC（Python 也要 64-bit）")
+
+warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+
+# ==================== 全域初始化 ====================
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+PICO_KEY = os.getenv("PICOVOICE_ACCESS_KEY")
+OWM_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+PPN_PATH = "Raphael.ppn"
+TEMPLATE_DIR = "templates"          # 模板資料夾
+DEFAULT_THRESHOLD = 0.73            # 基本門檻，視情況可調 0.68~0.80
+SCALES = [0.6, 0.8, 1.0, 1.2, 1.5]  # 多尺度範圍
+
+def find_template(template_name, threshold=DEFAULT_THRESHOLD, scales=SCALES):
+    """
+    在螢幕上尋找指定模板，返回中心座標 (x, y) 或 None
+    template_name: 不含 .png 的檔名，例如 "chrome"、"保存"、"下一頁"
+    """
+    template_path = os.path.join(TEMPLATE_DIR, f"{template_name}.png")
+    
+    if not os.path.exists(template_path):
+        print(f"[模板不存在] {template_path}")
+        return None
+
+    template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+    if template is None:
+        print(f"[讀取失敗] {template_path}")
+        return None
+
+    # 截取螢幕並轉灰階
+    screen = pyautogui.screenshot()
+    screen_cv = cv2.cvtColor(np.array(screen), cv2.COLOR_RGB2GRAY)
+
+    best_val = -1
+    best_loc = None
+    best_size = None
+
+    for scale in scales:
+        resized = cv2.resize(template, (0, 0), fx=scale, fy=scale)
+        if resized.shape[0] > screen_cv.shape[0] or resized.shape[1] > screen_cv.shape[1]:
+            continue
+
+        res = cv2.matchTemplate(screen_cv, resized, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+        if max_val > best_val and max_val >= threshold:
+            best_val = max_val
+            best_loc = max_loc
+            best_size = resized.shape
+
+    if best_loc is not None:
+        h, w = best_size
+        center_x = best_loc[0] + w // 2
+        center_y = best_loc[1] + h // 2
+        print(f"[匹配成功] {template_name} | 信心={best_val:.3f} | 位置=({center_x}, {center_y}) | scale={w/template.shape[1]:.2f}")
+        return (center_x, center_y)
+    
+    print(f"[無匹配] {template_name} 信心最高僅 {best_val:.3f} < {threshold}")
+    return None
+
+reader = easyocr.Reader(['ch_tra', 'en'], gpu=True)
+
+pygame.mixer.pre_init(44100, -16, 2, 512)
+try:
+    pygame.mixer.init()
+except Exception as e:
+    print(f"[警告] Pygame 初始化失敗，嘗試相容模式: {e}")
+    os.environ['SDL_AUDIODRIVER'] = 'dsound'
+    pygame.mixer.init()
+
+# ==================== 工具描述 ====================
+tools = [
+    {"type": "function", "function": {"name": "get_current_time", "description": "問現在時間"}},
+    {"type": "function", "function": {"name": "get_weather", "description": "查詢天氣", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}},
+    {"type": "function", "function": {"name": "control_computer", "description": "電腦控制", "parameters": {"type": "object", "properties": {"action": {"type": "string"}}}}},
+    {"type": "function", "function": {"name": "open_software", "description": "開啟桌面軟體", "parameters": {"type": "object", "properties": {"app_name": {"type": "string"}}}}},
+    {"type": "function", "function": {"name": "vision_click", "description": "點擊無文字圖標", "parameters": {"type": "object", "properties": {"target_description": {"type": "string"}}, "required": ["target_description"]}}},
+    {"type": "function", "function": {"name": "text_click", "description": "點擊帶文字按鈕", "parameters": {"type": "object", "properties": {"target_text": {"type": "string"}}, "required": ["target_text"]}}},
+    {"type": "function", "function": {"name": "set_timer", "description": "設定計時器", "parameters": {"type": "object", "properties": {"seconds": {"type": "integer"}, "label": {"type": "string"}}, "required": ["seconds", "label"]}}},
+    {"type": "function", "function": {"name": "web_search", "description": "網路搜尋", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "music_controller", "description": "音樂控制", "parameters": {"type": "object", "properties": {"action": {"type": "string"}, "song_name": {"type": "string"}, "platform": {"type": "string"}, "language": {"type": "string"}}}}},
+    {"type": "function", "function": {"name": "toggle_subtitles", "description": "切換字幕顯示", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["on", "off"]}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "shutdown_raphael", "description": "關閉系統"}},
+    {"type": "function", "function": {"name": "screen_assistant", "description": "畫面助手", "parameters": {"type": "object", "properties": {"user_intent": {"type": "string"}, "generated_code": {"type": "string"}}, "required": ["user_intent"]}}},
+    {"type": "function", "function": {"name": "get_system_status", "description": "系統狀態"}},
+]
+
+chat_history = [{"role": "system", "content": "你是拉菲爾。當使用者要求對畫面代碼除錯、優化或生成時，請使用 screen_assistant。"}]
+
+# ==================== 字幕視窗 ====================
 class SubtitleSignal(QObject):
-    # 定義一個信號，用來接收要顯示的文字
     text_updated = pyqtSignal(str)
+
+sub_signal = SubtitleSignal()
 
 class RaphaelSubtitleWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.is_enabled = False
-        # 置頂、無邊框、點擊穿透、不在工具列顯示
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowTransparentForInput)
         self.setAttribute(Qt.WA_TranslucentBackground)
         
         layout = QVBoxLayout()
         self.label = QLabel("")
-        # 科技感字體與顏色
-        self.label.setFont(QFont("Microsoft JhengHei",16, QFont.Bold))
+        self.label.setFont(QFont("Microsoft JhengHei", 16, QFont.Bold))
         self.label.setStyleSheet("""
             color: #FFFFFF;
-            background-color: rgba(0, 0, 0, 160); /* 稍微加深一點點更有質感 */
+            background-color: rgba(0, 0, 0, 160);
             border-radius: 15px;
-            padding: 7px 15px; /* 增加左右間距 */
+            padding: 7px 15px;
         """)
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setWordWrap(True)
-        
         layout.addWidget(self.label)
         self.setLayout(layout)
-
-        # 初始化隱藏
         self.hide()
-        
+
         self.timer = QTimer()
-        # 修正點：時間到時呼叫 self.hide，讓黑幕徹底消失
         self.timer.timeout.connect(self.hide_subtitle)
 
     def hide_subtitle(self):
@@ -73,159 +201,575 @@ class RaphaelSubtitleWindow(QWidget):
         self.hide()
 
     def display_text(self, text):
-        if not text: return
         if not self.is_enabled or not text: return
-        
         self.label.setText(text)
-        
-        # --- 動態調整視窗大小與位置 ---
-        # 根據文字內容重新計算標籤所需大小
         self.label.adjustSize()
-        self.adjustSize() 
-        
+        self.adjustSize()
         screen = QApplication.primaryScreen().geometry()
-        # 將視窗定位在螢幕底部中央 (距離底部 100 像素)
         new_width = min(screen.width() - 100, self.label.width() + 60)
         new_x = (screen.width() - new_width) // 2
         new_y = screen.height() - self.height() - 50
-        
         self.setGeometry(new_x, new_y, new_width, self.height())
-        
         self.show()
-        
-        # --- 延長顯示時間邏輯 ---
-        # 基礎 3 秒 + 每個字 0.3 秒 (例如 10 個字會顯示 6 秒)
         display_time = 1000 + (len(text) * 300)
         self.timer.start(display_time)
 
-def move_with_dynamic_speed(start_x, start_y, target_x, target_y):
-    """根據距離動態調整速度並移動滑鼠"""
-    import math # 確保有匯入
-    distance = math.sqrt((target_x - start_x)**2 + (target_y - start_y)**2)
-    screen_w = pyautogui.size()[0]
-    
-    # 計算時間：0.4 ~ 1.2 秒
-    duration = 0.4 + (distance / screen_w) * 0.8
-    duration = min(1.2, max(0.4, duration))
-    
-    print(f"[移動中] 距離: {int(distance)}px, 耗時: {duration:.2f}s")
-    
-    # 執行移動
-    pyautogui.moveTo(target_x, target_y, duration=duration, tween=pyautogui.easeInOutQuart)
-    time.sleep(0.1) # 抵達後緩衝
+# ==================== 控制中心 UI ====================
+class RaphaelControlCenter(QMainWindow):
 
-def vision_click(target_description):
-    """專門處理圖標、Logo、無文字按鈕"""
-    print(f"[視覺搜尋] 正在鎖定圖標：{target_description}...")
-    try:
-        # 獲取初始位置
-        start_x, start_y = pyautogui.position()
-        
-        # 獲取螢幕截圖與實際解析度
-        screenshot = pyautogui.screenshot()
-        screen_w, screen_h = pyautogui.size()
-        
-        # 將圖片轉為 Base64
-        buffered = BytesIO()
-        screenshot.save(buffered, format="PNG")
-        img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
-        
-        prompt_text = (
-            f"這是一個 {screen_w}x{screen_h} 的電腦螢幕截圖。"
-            f"請精確定位「{target_description}」圖標的中心位置。"
-            f"請以圖片左上角為 (0,0)，右下角為 (1000,1000) 比例計算。"
-            f"請回傳 JSON 格式: {{\"x\": 0-1000, \"y\": 0-1000}}"
+    chat_updated = pyqtSignal(str)
+    need_path_dialog = pyqtSignal(str, str)  # app_name, prompt_text
+    rms_updated = pyqtSignal(float)
+    
+
+    def __init__(self, subtitle_win):
+        super().__init__()
+        self.recorder = None
+        self.porcupine = None
+        self.sub_win = subtitle_win
+        self.current_ppn_path = r"C:\Raphael_Bot\Raphael.ppn"  # 預設 PPN 路徑
+        self.api_key_input = None  # 稍後在 init_ui 建立
+        self.gpu_initialized = False
+        try:
+            from pynvml import nvmlInit
+            nvmlInit()
+            self.gpu_initialized = True
+            print("[系統] GPU 監控初始化成功")
+        except Exception as e:
+            print(f"[系統] GPU 監控跳過: {e}")
+        self.init_ui()
+        self.mic_selector.currentIndexChanged.connect(self.on_mic_changed)
+
+        self.stats_timer = QTimer()
+        self.stats_timer.timeout.connect(self.refresh_stats)
+        self.stats_timer.start(2000)
+        self.chat_history_list = [{"role": "system", "content": "你是拉菲爾，一位專業助理。"}]
+        self.rms_updated.connect(self.update_rms_display)
+        self.chat_updated.connect(self.append_chat_message)
+        self.need_path_dialog.connect(self.show_path_dialog)
+        QTimer.singleShot(500, self.initialize_audio)  # 延遲 0.5 秒確保 UI 就緒
+
+
+    # 然後在主執行緒（例如 RaphaelControlCenter 的 __init__ 後）啟動一個 worker
+    def speak_worker():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        while True:
+            try:
+                text = speak_queue.get(timeout=1.0)
+                loop.run_until_complete(speak(text))
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"語音 worker 錯誤: {e}")
+
+    # 在 if __name__ == "__main__": 裡面
+    threading.Thread(target=speak_worker, daemon=True).start()
+    # 在 RaphaelControlCenter 類別裡的 show_path_dialog 修改版
+    def show_path_dialog(self, app_name, prompt_text):
+        from PyQt5.QtWidgets import QMessageBox, QFileDialog
+
+        clean_name = app_name.lower().replace("幫我開啟", "").replace("打開", "").replace("開啟", "").strip()
+
+        # 先顯示提示，並優先建議選「應用程式檔案」
+        reply = QMessageBox.question(
+            self,
+            "找不到應用程式",
+            f"{prompt_text}\n\n建議：直接選擇應用程式的執行檔（.exe 或 .lnk）\n\n"
+            "要現在選擇執行檔嗎？\n（選「否」則會詢問資料夾）",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes   # 預設 Yes → 先選檔案
         )
 
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt_text},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}}
-                ]
-            }],
-            response_format={ "type": "json_object" }
+        msg = ""
+
+        if reply == QMessageBox.Yes:
+            # 優先選擇單一執行檔
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                f"請選擇「{app_name}」的執行檔",
+                os.path.expanduser("~"),
+                "執行檔 (*.exe *.lnk);;所有檔案 (*.*)"
+            )
+
+            if file_path:
+                try:
+                    subprocess.Popen(f'start "" "{file_path}"', shell=True)
+                    app_paths[clean_name] = file_path
+                    with open(APP_PATHS_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(app_paths, f, ensure_ascii=False, indent=4)
+                    msg = f"已開啟並記住：{os.path.basename(file_path)}"
+                except Exception as e:
+                    msg = f"開啟失敗：{str(e)}"
+            else:
+                msg = "已取消選擇執行檔。"
+
+        elif reply == QMessageBox.No:
+            # 次要選項：選擇資料夾
+            folder = QFileDialog.getExistingDirectory(
+                self,
+                "選擇桌面或應用資料夾",
+                os.path.expanduser("~")
+            )
+            if folder:
+                app_paths["custom_desktop_path"] = folder
+                with open(APP_PATHS_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(app_paths, f, ensure_ascii=False, indent=4)
+                msg = "已記住新桌面路徑，下次搜尋會使用此資料夾。"
+                # 可以選擇這裡再呼叫一次 open_software(app_name) 自動重試
+            else:
+                msg = "已取消選擇資料夾。"
+
+        else:
+            msg = "已取消操作。"
+        self.chat_updated.emit(f"<b style='color:#82AAFF;'>拉菲爾：</b> {msg}")
+
+    def append_chat_message(self, message):
+        self.chat_history.append(message)
+        # 強制捲動到底
+        QTimer.singleShot(50, lambda: self.chat_history.verticalScrollBar().setValue(
+            self.chat_history.verticalScrollBar().maximum()
+        ))
+
+    def initialize_audio(self):
+        if not hasattr(self, 'current_ppn_path'):
+            self.current_ppn_path = r"C:\Raphael_Bot\Raphael.ppn"
+            print("[警告] current_ppn_path 未定義，已使用預設值")
+        try:
+            device_idx = self.mic_selector.currentIndex()
+            device_name = self.mic_selector.currentText()
+            print(f"[音訊初始化] 索引：{device_idx}，裝置名稱：{device_name}")
+
+            # 停止舊的（安全處理）
+            if self.recorder:
+                try:
+                    self.recorder.stop()
+                    self.recorder.delete()
+                except Exception as stop_e:
+                    print(f"[停止舊 recorder 失敗，但繼續] {stop_e}")
+                self.recorder = None
+
+            # 重建 porcupine
+            if self.porcupine:
+                self.porcupine.delete()
+            self.porcupine = pvporcupine.create(
+                access_key=os.getenv("PICOVOICE_ACCESS_KEY"),
+                keyword_paths=[self.current_ppn_path],
+                sensitivities=[1]
+            )
+            frame_len = self.porcupine.frame_length
+            print(f"[Porcupine] frame_length = {frame_len}")
+
+            # 建立新 recorder
+            self.recorder = PvRecorder(
+                device_index=device_idx,
+                frame_length=frame_len
+            )
+            self.recorder.start()
+            print(f"[初始化成功] 使用裝置：{self.recorder.selected_device}")
+
+            # 強制測試讀取 3 次
+            for i in range(3):
+                test_frame = self.recorder.read()
+                if test_frame:
+                    max_val = max(map(abs, test_frame))
+                    print(f"[測試 {i+1}/3] 長度={len(test_frame)}, 最大振幅={max_val}")
+                    if max_val > 0:
+                        print("→ 測試成功！麥克風有輸入")
+                        break
+                else:
+                    print(f"[測試 {i+1}/3] 讀取失敗（空 frame）")
+                time.sleep(0.2)
+
+        except Exception as e:
+            print(f"[音訊初始化失敗] {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def select_ppn_file(self):
+        from PyQt5.QtWidgets import QFileDialog
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "選擇 PPN 喚醒詞模型檔案",
+            r"C:\Raphael_Bot",  # 預設開啟目錄
+            "PPN Files (*.ppn);;All Files (*)"
         )
 
-        data = json.loads(response.choices[0].message.content)
+        if file_path:
+            self.current_ppn_path = file_path
+            self.ppn_label.setText(f"目前：{os.path.basename(file_path)}")
+            print(f"[PPN 變更] 新路徑：{file_path}")
+            
+            # 立即重新初始化音訊（使用新 PPN）
+            self.initialize_audio()
+
+    def apply_new_api_key(self):
+        new_key = self.api_key_input.text().strip()
+        if not new_key:
+            print("[警告] API Key 為空")
+            return
+
+        # 更新環境變數（供 pvporcupine 使用）
+        os.environ["PICOVOICE_ACCESS_KEY"] = new_key
+        print(f"[API Key 套用] 新 Key 已設定（長度：{len(new_key)}）")
+
+        # 重新初始化音訊（使用新 Key）
+        self.initialize_audio()
+
+    def on_mic_changed(self, index):
+        print(f"[麥克風變更] 新索引：{index} ({self.mic_selector.currentText()})")
         
-        # 核心計算邏輯
-        # 使用 float 確保精確度，再轉回 int
-        target_x = int(float(data['x']) * screen_w / 1000)
-        target_y = int(float(data['y']) * screen_h / 1000)
-        
-        print(f"DEBUG: AI 回傳原始值: x={data['x']}, y={data['y']}")
-        print(f"DEBUG: 映射到螢幕 ({screen_w}x{screen_h}) 的座標是: ({target_x}, {target_y})")
-        
-        # 執行移動與點擊
-        move_with_dynamic_speed(start_x, start_y, target_x, target_y)
-        pyautogui.click()
-        
-        return f"Success: 已定位並點擊圖標「{target_description}」。"
-    except Exception as e:
-        return f"圖形辨識失敗：{e}"
+        # 先安全停止舊的
+        if self.recorder:
+            try:
+                self.recorder.stop()
+                self.recorder.delete()
+            except Exception as stop_err:
+                print(f"[停止舊 recorder 失敗] {stop_err}")
+            self.recorder = None
+
+        # 強制延遲，讓 Windows 音訊堆疊釋放（關鍵！）
+        time.sleep(1.5)  # 1.5 秒通常足夠
+
+        # 重試 2 次初始化
+        for attempt in range(2):
+            try:
+                self.initialize_audio()
+                print(f"[變更成功] 已使用新裝置")
+                return
+            except Exception as e:
+                print(f"[變更重試 {attempt+1}/2] 失敗：{e}")
+                time.sleep(0.5)
+        print("[變更最終失敗] 請重啟程式或檢查麥克風權限")
     
-def text_click(target_text):
-    """專門處理帶有文字的按鈕或連結"""
-    print(f"[文字辨識] 正在尋找關鍵字：{target_text}...")
-    try:
-        start_x, start_y = pyautogui.position()
-        screenshot = pyautogui.screenshot()
+    def update_rms_display(self, rms_value):
+        color = "#82AAFF"
+        status = "安靜"
+        if rms_value > 800:
+            color = "red"
+            status = "大聲"
+        elif rms_value > 300:
+            color = "orange"
+            status = "正常"
         
-        # 使用 EasyOCR 直接精確定位文字中心
-        results = reader.readtext(np.array(screenshot))
+        self.rms_label.setText(f"RMS: {rms_value:.1f} | 音量: {status}")
+        self.rms_label.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: bold;")
         
-        for (bbox, text, prob) in results:
-            if target_text.lower() in text.lower():
-                # 計算中心點
-                (tl, tr, br, bl) = bbox
-                target_x = int((tl[0] + br[0]) / 2)
-                target_y = int((tl[1] + br[1]) / 2)
-                
-                print(f"DEBUG: 計算出的目標座標是 ({target_x}, {target_y})")
-                print(f"[執行] 找到文字「{text}」，信心度：{prob:.2f}")
-                move_with_dynamic_speed(start_x, start_y, target_x, target_y)
-                pyautogui.click()
-                return f"Success: 已找到並點擊文字「{text}」。"
+        # 進度條顯示（可加 log 縮放讓它更好看）
+        display_value = min(int(rms_value * 1.5), 1200)  # 放大一點讓低音量也看得見
+        self.rms_bar.setValue(display_value)
+
+    def init_ui(self):
+        self.setWindowTitle("Raphael AI - 指令控制中心")
+        self.resize(1000, 700)
+        self.setStyleSheet("""
+            QMainWindow { background-color: #0F111A; }
+            QLabel { color: #82AAFF; font-weight: bold; }
+            QProgressBar { border: 1px solid #333; border-radius: 5px; text-align: center; color: white; background-color: #1A1C25; }
+            QProgressBar::chunk { background-color: #82AAFF; }
+            QTextEdit { background-color: #1A1C25; color: #D6DEEB; border: none; border-radius: 10px; font-size: 14px; }
+            QLineEdit { background-color: #242936; color: white; border: 1px solid #333; border-radius: 20px; padding: 10px 20px; }
+            QPushButton#SendBtn { background-color: #82AAFF; color: #0F111A; border-radius: 20px; font-weight: bold; }
+        """)
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+
+        # 左側面板
+        left_panel = QVBoxLayout()
+        left_panel.addWidget(QLabel("📊 硬體監控系統"))
+        self.cpu_bar = QProgressBar(); self.cpu_bar.setRange(0, 100)
+        self.ram_bar = QProgressBar(); self.ram_bar.setRange(0, 100)
+        self.gpu_bar = QProgressBar(); self.gpu_bar.setRange(0, 100)
+        left_panel.addWidget(QLabel("CPU Usage")); left_panel.addWidget(self.cpu_bar)
+        left_panel.addWidget(QLabel("RAM Usage")); left_panel.addWidget(self.ram_bar)
+        left_panel.addWidget(QLabel("GPU Usage")); left_panel.addWidget(self.gpu_bar)
+
+        left_panel.addSpacing(30)
+        left_panel.addWidget(QLabel("🎤 語音輸入裝置"))
+        self.mic_selector = QComboBox()
+        self.mic_selector.addItems(PvRecorder.get_available_devices())
+        self.mic_selector.setStyleSheet("background: #242936; color: white; padding: 5px;")
+        left_panel.addWidget(self.mic_selector)
+        # ── 新增：即時 RMS 顯示 ──
+        left_panel.addSpacing(20)
+        left_panel.addWidget(QLabel("即時音量監測 (RMS)"))
         
-        return f"文字辨識失敗：找不到包含「{target_text}」的按鈕。"
-    except Exception as e:
-        return f"文字處理出錯：{e}"
-# 隱藏警告
-warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+        self.rms_label = QLabel("RMS: 0.0 | 音量: 安靜")
+        self.rms_label.setStyleSheet("color: #82AAFF; font-size: 14px; font-weight: bold;")
+        left_panel.addWidget(self.rms_label)
 
-# --- 1. 初始化與全域設定 ---
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-PICO_KEY = os.getenv("PICOVOICE_ACCESS_KEY")
-OWM_API_KEY = os.getenv("OPENWEATHER_API_KEY") 
-PPN_PATH = "Raphael.ppn"
+        self.rms_bar = QProgressBar()
+        self.rms_bar.setRange(0, 1200)  # 調高一點範圍，避免太快滿
+        self.rms_bar.setValue(0)
+        self.rms_bar.setFormat("RMS: %v")
+        self.rms_bar.setStyleSheet("""
+            QProgressBar { background-color: #1A1C25; border: 1px solid #333; }
+            QProgressBar::chunk { background-color: #82AAFF; }
+        """)
+        left_panel.addWidget(self.rms_bar)
 
-reader = easyocr.Reader(['ch_tra', 'en'], gpu=True)
+        left_panel.addSpacing(20)
+        self.api_status = QLabel("● OpenAI API: Connected")
+        self.api_status.setStyleSheet("color: #C3E88D;")
+        left_panel.addWidget(self.api_status)
+        left_panel.addStretch()
+        main_layout.addLayout(left_panel, 1)
+        left_panel.addSpacing(10)
+        self.reinit_btn = QPushButton("重新初始化麥克風")
+        self.reinit_btn.clicked.connect(self.initialize_audio)
+        left_panel.addWidget(self.reinit_btn)
+        left_panel.addSpacing(20)
+        left_panel.addWidget(QLabel("喚醒詞模型 (.ppn)"))
 
-def select_microphone():
-    devices = PvRecorder.get_available_devices()
-    print("\n--- 可用的麥克風裝置列表 ---")
-    for i, device in enumerate(devices):
-        print(f"[{i}] {device}")
-    try:
-        choice = input(f"\n請輸入麥克風 ID (預設使用 ID 0): ").strip()
-        return int(choice) if choice else 0
-    except: return 0
-# DEVICE_INDEX = 2
-DEVICE_INDEX = select_microphone()
-try:
-    pygame.mixer.pre_init(44100, -16, 2, 512) # 預設採樣率，縮小緩衝區
-    pygame.mixer.init()
-except Exception as e:
-    print(f"[警告] Pygame Mixer 初始化失敗，嘗試相容模式: {e}")
-    os.environ['SDL_AUDIODRIVER'] = 'dsound' # 強制切換至 DirectSound 驅動
-    pygame.mixer.init()
+        # 顯示目前 PPN 路徑
+        self.ppn_label = QLabel(f"目前：{os.path.basename(self.current_ppn_path)}")
+        self.ppn_label.setStyleSheet("color: #82AAFF; font-size: 12px;")
+        left_panel.addWidget(self.ppn_label)
 
-# --- 2. 工具函數定義 (保留所有原有功能) ---
+        # 選擇 PPN 按鈕
+        self.select_ppn_btn = QPushButton("選擇 PPN 檔案")
+        self.select_ppn_btn.clicked.connect(self.select_ppn_file)
+        left_panel.addWidget(self.select_ppn_btn)
 
+        left_panel.addSpacing(20)
+        left_panel.addWidget(QLabel("自訂桌面路徑（用來開啟應用）"))
+
+        # 顯示目前路徑
+        self.desktop_path_label = QLabel("目前未設定")
+        self.desktop_path_label.setStyleSheet("color: #82AAFF; font-size: 12px;")
+        left_panel.addWidget(self.desktop_path_label)
+
+        # 選擇按鈕
+        self.select_desktop_btn = QPushButton("選擇桌面資料夾")
+        self.select_desktop_btn.clicked.connect(self.select_desktop_path)
+        left_panel.addWidget(self.select_desktop_btn)
+
+        # 如果有記住的路徑，顯示出來
+        if "custom_desktop_path" in app_paths:
+            self.desktop_path_label.setText(f"目前：{app_paths['custom_desktop_path']}")
+
+
+        left_panel.addSpacing(10)
+        left_panel.addWidget(QLabel("Picovoice API Key"))
+
+        # API Key 輸入框
+        self.api_key_input = QLineEdit(os.getenv("PICOVOICE_ACCESS_KEY", ""))
+        self.api_key_input.setEchoMode(QLineEdit.Password)  # 隱藏輸入（像密碼）
+        self.api_key_input.setPlaceholderText("輸入你的 Picovoice Access Key")
+        left_panel.addWidget(self.api_key_input)
+
+        # 套用按鈕
+        self.apply_api_btn = QPushButton("套用 API Key")
+        self.apply_api_btn.clicked.connect(self.apply_new_api_key)
+        left_panel.addWidget(self.apply_api_btn)
+
+        # left_panel.addSpacing(10)
+
+        # 右側面板
+        right_panel = QVBoxLayout()
+        self.chat_history = QTextEdit()
+        self.chat_history.setReadOnly(True)
+        self.chat_history.setPlaceholderText("拉菲爾正在待命...")
+        right_panel.addWidget(self.chat_history)
+
+        input_row = QHBoxLayout()
+        self.text_input = QLineEdit()
+        self.text_input.setPlaceholderText("輸入指令或問題...")
+        self.text_input.returnPressed.connect(self.handle_text_submit)
+        self.send_button = QPushButton("發送")
+        self.send_button.setObjectName("SendBtn")
+        self.send_button.setFixedSize(80, 40)
+        self.send_button.clicked.connect(self.handle_text_submit)
+        input_row.addWidget(self.text_input)
+        input_row.addWidget(self.send_button)
+        right_panel.addLayout(input_row)
+        main_layout.addLayout(right_panel, 3)
+
+    def select_desktop_path(self):
+        from PyQt5.QtWidgets import QFileDialog
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "選擇您的桌面或常用應用資料夾",
+            app_paths.get("custom_desktop_path", os.path.expanduser("~"))
+        )
+
+        if folder:
+            app_paths["custom_desktop_path"] = folder
+            with open(APP_PATHS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(app_paths, f, ensure_ascii=False, indent=4)
+            self.desktop_path_label.setText(f"目前：{folder}")
+            print(f"[桌面路徑已設定] {folder}")
+        else:
+            print("[使用者取消選擇桌面路徑]")
+
+    def reset_desktop_path(self):
+        if "custom_desktop_path" in app_paths:
+            del app_paths["custom_desktop_path"]
+            with open(APP_PATHS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(app_paths, f, ensure_ascii=False, indent=4)
+            print("[桌面路徑已重設為預設]")
+
+    def refresh_stats(self):
+        self.cpu_bar.setValue(int(psutil.cpu_percent()))
+        self.ram_bar.setValue(int(psutil.virtual_memory().percent))
+        if self.gpu_initialized:
+            try:
+                from pynvml import nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates
+                handle = nvmlDeviceGetHandleByIndex(0)
+                util = nvmlDeviceGetUtilizationRates(handle)
+                self.gpu_bar.setValue(util.gpu)
+            except:
+                pass
+        else:
+            self.gpu_bar.setValue(15)
+
+    def closeEvent(self, event):
+        if self.gpu_initialized:
+            try:
+                from pynvml import nvmlShutdown
+                nvmlShutdown()
+            except: pass
+        event.accept()
+
+    def handle_text_submit(self):
+        query = self.text_input.text().strip()
+        if query:
+            self.chat_history.append(f"<b style='color:#C792EA;'>你：</b> {query}")
+            self.text_input.clear()
+            threading.Thread(target=self.sync_process_wrapper, args=(query,), daemon=True).start()
+
+    def sync_process_wrapper(self, query):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self.process_ai_logic(query))
+
+    async def process_ai_logic(self, user_text):
+        if not user_text.strip():
+            await speak("沒聽清楚，再說一次好嗎？")
+            return
+
+        print(f"→ 使用者說：{user_text}")
+
+        # 把使用者輸入加進歷史
+        self.chat_history_list.append({"role": "user", "content": user_text})
+
+        # 判斷模型
+        coding_keywords = ["程式", "寫", "代碼", "code", "編寫", "生成", "腳本", "python", "html", "cpp", "java"]
+        is_coding = any(k in user_text.lower() for k in coding_keywords)
+        selected_model = "gpt-4o" if is_coding else "gpt-4o-mini"
+        print(f"系統判定任務類型，使用模型: {selected_model}")
+
+        try:
+            # 第一輪：帶工具
+            response = client.chat.completions.create(
+                model=selected_model,
+                messages=self.chat_history_list,
+                tools=tools,
+                tool_choice="auto"
+            )
+
+            msg = response.choices[0].message
+            self.chat_history_list.append(msg)  # 先存 assistant 訊息（包含 tool_calls）
+
+            final_ans = ""
+
+            if msg.tool_calls:
+                tool_messages = []  # 確保這裡一定有定義
+
+                for tc in msg.tool_calls:
+                    fn = tc.function.name
+                    args = json.loads(tc.function.arguments)
+
+                    print(f"[Tool Call] {fn} → {args}")
+
+                    res = ""
+
+                    if fn == "get_current_time":
+                        res = get_current_time()
+                    elif fn == "get_weather":
+                        res = get_weather(args.get("city"))
+                    elif fn == "control_computer":
+                        res = control_computer(args.get("action"))
+                    elif fn == "open_software":
+                        res = open_software(args.get("app_name"))
+
+                        if "[NEED_FILEDIALOG]" in res:
+                            prompt_text = res.replace("[NEED_FILEDIALOG]", "").strip()
+                            # 發送信號彈窗
+                            self.need_path_dialog.emit(args.get("app_name"), prompt_text)
+                            res = "正在詢問您選擇應用路徑，請稍等..."
+                            # self.chat_updated.emit(f"<b style='color:#82AAFF;'>拉菲爾：</b> {res}")
+                            await speak(res)
+                            
+                            # 👇 【修復 Error 400】必須把工具執行結果存入歷史，再 return
+                            self.chat_history_list.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "name": fn,
+                                "content": "已跳出視窗等待使用者選擇路徑，本次對話流程暫停。"
+                            })
+                            
+                            return  # 結束本次 loop，等待彈窗結果
+                    elif fn == "vision_click":
+                        res = vision_click(args.get("target_description"))
+                    elif fn == "text_click":
+                        res = text_click(args.get("target_text"))
+                    elif fn == "set_timer":
+                        await set_timer(args.get("seconds"), args.get("label"))
+                        res = f"已設定 {args.get('label')} 在 {args.get('seconds')} 秒後。"
+                    elif fn == "web_search":
+                        res = web_search(args.get("query"))
+                    elif fn == "music_controller":
+                        res = music_controller(args)
+                    elif fn == "toggle_subtitles":
+                        res = toggle_subtitles(args.get("action"))
+                    elif fn == "shutdown_raphael":
+                        res = shutdown_raphael()
+                        await speak(res)
+                        QApplication.quit()
+                        return
+                    elif fn == "screen_assistant":
+                        res = screen_assistant(args.get("user_intent"))
+                    elif fn == "get_system_status":
+                        res = get_system_status()
+
+                    # 只在有真實結果時才加 tool 訊息
+                    tool_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": fn,
+                        "content": res or "已執行"
+                    })
+
+                # 把所有 tool 結果一次加進歷史（保持順序）
+                self.chat_history_list.extend(tool_messages)
+
+                # 第二輪總結（不帶 tools）
+                final_response = client.chat.completions.create(
+                    model=selected_model,
+                    messages=self.chat_history_list
+                )
+                final_ans = final_response.choices[0].message.content
+            else:
+                final_ans = msg.content
+
+            # 最終存歷史並回覆
+            self.chat_history_list.append({"role": "assistant", "content": final_ans})
+            await speak(final_ans)
+
+            # UI 更新
+            # self.chat_updated.emit(f"<b style='color:#82AAFF;'>拉菲爾：</b> {final_ans}")
+
+        except Exception as e:
+            print(f"AI 處理錯誤: {e}")
+            await speak("抱歉，剛剛出了點問題，能再說一次嗎？")
+    
+
+# ==================== 工具函數實作 ====================
 def play_sound(filename):
     try:
         if os.path.exists(filename):
@@ -237,93 +781,151 @@ def get_current_time():
     return f"現在時間是 {datetime.datetime.now().strftime('%Y年%m月%d日 %H:%M:%S')}"
 
 def get_weather(city="Chiayi"):
-    # 關鍵修正：如果 city 是 None 或空字串，強制設為預設值
-    if not city:
-        city = "嘉義"
+    if not city: city = "嘉義"
     try:
-        # 現在這裡絕對安全，因為 city 一定是字串
         clean_city = city.replace("市", "").replace("縣", "")
-        city_map = {
-            "台北": "Taipei", "新北": "New Taipei", "桃園": "Taoyuan", 
-            "台中": "Taichung", "台南": "Tainan", "高雄": "Kaohsiung", 
-            "嘉義": "Chiayi", "雲林": "Yunlin"
-        }
+        city_map = {"台北": "Taipei", "新北": "New Taipei", "桃園": "Taoyuan", "台中": "Taichung", "台南": "Tainan", "高雄": "Kaohsiung", "嘉義": "Chiayi", "雲林": "Yunlin"}
         search_city = city_map.get(clean_city, clean_city)
         url = f"http://api.openweathermap.org/data/2.5/weather?q={search_city}&appid={OWM_API_KEY}&units=metric&lang=zh_tw"
         res = requests.get(url, timeout=5).json()
         if res.get("cod") == 200:
             return f"{city}目前{res['weather'][0]['description']}，氣溫 {res['main']['temp']} 度。"
-        return f"找不到 {city} 的天氣資訊（錯誤碼：{res.get('cod')}）。"
+        return f"找不到 {city} 的天氣資訊。"
     except Exception as e:
-        print(f"DEBUG 天氣錯誤: {e}")
-        return "天氣連線失敗，請檢查網路或 API KEY。"
+        print(f"天氣錯誤: {e}")
+        return "天氣查詢失敗。"
 
 def control_computer(action):
     if action == "shutdown": os.system("shutdown /s /t 15"); return "十秒後關機。"
     if action == "restart": os.system("shutdown /r /t 15"); return "十秒後重啟。"
-    if action == "cancel": os.system("shutdown /a"); return "已為您取消關機或重啟排程。"
+    if action == "cancel": os.system("shutdown /a"); return "已取消關機。"
     if action == "sleep": os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0"); return "進入睡眠。"
     return "無效操作。"
 
+# ==================== 工具函數：open_software ====================
 def open_software(app_name):
-    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-    target_name = app_name.replace("幫我開啟", "").replace("打開", "").strip().lower()
-    
-    try:
-        items = os.listdir(desktop_path)
-        for item in items:
-            name_without_ext = os.path.splitext(item)[0].lower()
-            
-            if target_name in name_without_ext and item.lower().endswith((".lnk", ".url")):
-                full_path = os.path.normpath(os.path.join(desktop_path, item)) # 確保路徑格式正確
-                
-                # 改用這行：強制透過 Windows Shell 開啟
-                subprocess.Popen(f'start "" "{full_path}"', shell=True)
-                
-                return f"已成功下達開啟指令：{item}"
-        
-        return "桌面找不到捷徑。"
-    except Exception as e:
-        return f"失敗：{e}"
+    global app_paths
+
+    clean_name = app_name.replace("幫我開啟", "").replace("打開", "").replace("開啟", "").strip().lower()
+
+    # 1. 先檢查是否已經記住單一應用路徑
+    if clean_name in app_paths and clean_name != "custom_desktop_path":
+        saved_path = app_paths[clean_name]
+        if os.path.exists(saved_path):
+            try:
+                subprocess.Popen(f'start "" "{saved_path}"', shell=True)
+                return f"已開啟記住的應用：{clean_name}"
+            except Exception as e:
+                del app_paths[clean_name]
+                return f"[NEED_FILEDIALOG]記住的路徑失效，請重新選擇「{clean_name}」的執行檔。"
+        else:
+            del app_paths[clean_name]
+            return f"[NEED_FILEDIALOG]記住的路徑不存在，請重新選擇「{clean_name}」的執行檔。"
+
+    # 2. 檢查是否有自訂桌面路徑
+    desktop_path = app_paths.get("custom_desktop_path")
+    if desktop_path and os.path.exists(desktop_path):
+        try:
+            for item in os.listdir(desktop_path):
+                name_without_ext = os.path.splitext(item)[0].lower()
+                if clean_name in name_without_ext and item.lower().endswith((".lnk", ".exe", ".url")):
+                    full_path = os.path.join(desktop_path, item)
+                    if os.path.exists(full_path):
+                        try:
+                            subprocess.Popen(f'start "" "{full_path}"', shell=True)
+                            app_paths[clean_name] = full_path  # 記住這次找到的路徑
+                            with open(APP_PATHS_FILE, 'w', encoding='utf-8') as f:
+                                json.dump(app_paths, f, ensure_ascii=False, indent=4)
+                            return f"已從自訂桌面開啟：{item} (已記住)"
+                        except Exception as e:
+                            return f"[NEED_FILEDIALOG]開啟失敗：{e}。請手動選擇應用程式。"
+        except Exception as e:
+            return f"[NEED_FILEDIALOG]自訂桌面搜尋失敗：{e}。請手動選擇。"
+
+    # 3. 都找不到 → 要求彈出選擇視窗（優先選檔案）
+    return f"[NEED_FILEDIALOG]找不到「{clean_name}」，請選擇應用程式檔案（.exe 或 .lnk）或資料夾。"
 
 def web_search(query):
     webbrowser.open(f"https://www.google.com/search?q={query}")
-    return f"已搜尋 {query}。"
+    return f"已為您搜尋：{query}"
 
 def get_system_status():
-    return f"CPU: {psutil.cpu_percent()}%，記憶體: {psutil.virtual_memory().percent}%。"
+    return f"CPU: {psutil.cpu_percent()}%，記憶體: {psutil.virtual_memory().percent}%"
 
-async def set_timer(seconds, label="計時器"):
-    await asyncio.sleep(seconds)
-    return "" 
-
-def click_text_on_screen(target_text):
-    """執行單次搜尋與點擊，回傳是否成功找到目標"""
+# 替換原本的 set_timer
+async def set_timer(time_str, label="計時器"):
+    """支援自然語言與絕對時間（中文超強）"""
     try:
-        screenshot = pyautogui.screenshot()
-        img_gray = np.array(screenshot.convert('L'))
-        results = reader.readtext(img_gray)
-        
-        # 轉小寫進行模糊比對
-        search_target = target_text.lower()
-        for (bbox, text, prob) in results:
-            if search_target in text.lower():
-                # 點擊該文字塊的右側中心
-                rx = int(bbox[1][0])
-                ry = int((bbox[1][1] + bbox[2][1]) / 2)
-                pyautogui.click(rx, ry)
-                return True # 找到並點擊了
-        return False # 畫面上已無目標
+        # 先讓 dateparser 解析
+        dt = dateparser.parse(time_str, languages=['zh', 'zh-TW', 'en'])
+        if not dt:
+            # 如果沒解析成功，當成相對秒數
+            seconds = int(''.join(filter(str.isdigit, time_str))) or 10
+            await asyncio.sleep(seconds)
+            await speak(f"「{label}」時間到！")
+            return
+
+        # 計算距離現在的秒數
+        now = datetime.datetime.now()
+        delta = (dt - now).total_seconds()
+        if delta < 0:
+            delta += 86400  # 隔天同時間
+
+        print(f"[計時器] 預計在 {dt.strftime('%H:%M:%S')} 觸發（還有 {int(delta)} 秒）")
+        await asyncio.sleep(delta)
+        await speak(f"「{label}」時間到！")
     except Exception as e:
-        print(f"視覺辨識異常: {e}")
-        return False
+        await speak("計時器格式我沒聽懂，請再說一次～")
+
+def move_with_dynamic_speed(start_x, start_y, target_x, target_y):
+    distance = math.sqrt((target_x - start_x)**2 + (target_y - start_y)**2)
+    screen_w = pyautogui.size()[0]
+    duration = 0.4 + (distance / screen_w) * 0.8
+    duration = min(1.2, max(0.4, duration))
+    pyautogui.moveTo(target_x, target_y, duration=duration, tween=pyautogui.easeInOutQuart)
+    time.sleep(0.1)
+
+def vision_click(target_description):
+    """
+    用法：說「點擊 chrome」「點擊設定齒輪」「點擊紅色 X」
+    對應 templates/chrome.png、templates/設定齒輪.png 等
+    """
+    print(f"[vision_click] 目標：{target_description}")
+    
+    # 簡單正規化檔名
+    name = target_description.lower().replace(" ", "").replace("圖示", "").replace("按鈕", "")
+    
+    center = find_template(name)
+    if center:
+        move_with_dynamic_speed(*pyautogui.position(), *center)
+        pyautogui.click()
+        return f"已點擊圖示/按鈕「{target_description}」"
+    else:
+        return f"找不到「{target_description}」的模板，請確認 templates/{name}.png 存在"
+
+def text_click(target_text):
+    """
+    用法：說「點擊 儲存」「點擊 確認」「點擊 取消」
+    對應 templates/儲存.png、templates/確認.png 等
+    """
+    print(f"[text_click] 目標文字：{target_text}")
+    
+    # 檔名直接使用輸入文字（可再客製規則）
+    name = target_text.strip()
+    
+    center = find_template(name, threshold=0.70)  # 文字按鈕可稍降低門檻
+    if center:
+        move_with_dynamic_speed(*pyautogui.position(), *center)
+        pyautogui.click()
+        return f"已點擊文字按鈕「{target_text}」"
+    else:
+        return f"找不到「{target_text}」的按鈕模板"
 
 def screen_assistant(user_intent):
     """
-    整合型螢幕助手：具備 9 大功能分支、語言感知、精確物理退格。
-    新增邏輯：
-    1. 關鍵字偵測：只有說到「所有/全部」才會執行多點任務。
-    2. 任務點計數：預設為 1，防止 generate 動作導致的無限循環。
+    原版完整功能：畫面文字/程式碼全自動助手
+    支援：更改、刪除、優化、生成、擴充、翻譯、除錯
+    使用 EasyOCR + GPT 多輪精準編輯 + 物理退格
     """
     print(f"[螢幕助手] 啟動執行流程，原始指令：{user_intent}")
     
@@ -337,7 +939,7 @@ def screen_assistant(user_intent):
         intent_res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": intent_prompt}],
-            response_format={ "type": "json_object" }
+            response_format={"type": "json_object"}
         )
         it = json.loads(intent_res.choices[0].message.content)
         t_branch = it.get('branch')
@@ -356,11 +958,10 @@ def screen_assistant(user_intent):
     screen_h = pyautogui.size()[1]
     filtered_init = [res for res in initial_results if 60 < res[0][0][1] < (screen_h - 60)]
     
-    # 判斷使用者是否要求「全部/所有」
+    # 判斷是否為全量模式
     is_all_task = any(word in user_intent for word in ["所有", "全部", "所有內容", "all", "every", "每個"])
     
     if is_all_task:
-        # 讓 AI 掃描畫面並計算目標點數量
         count_prompt = (
             f"任務：在『{t_anchor}』處執行『{t_act}』。目標：{t_goal}\n"
             f"目前螢幕內容：\n" + "\n".join([f"ID {i}: [{res[1]}]" for i, res in enumerate(filtered_init)]) + "\n"
@@ -376,15 +977,14 @@ def screen_assistant(user_intent):
         except:
             task_count = 1
     else:
-        # 預設為 1，即使畫面上有 testing=testing，也只處理一個
         task_count = 1
         print("[系統] 單次執行模式，預設處理 1 個匹配目標。")
 
-    # --- 第三階段：精確循環執行 ---
+    # --- 第三階段：精確循環執行（原版核心）---
     for i in range(task_count):
         print(f"[進度] 執行中：{i+1}/{task_count}...")
         
-        # 每一輪重新截圖確保位移後的座標依然正確
+        # 每一輪重新截圖確保座標正確
         curr_screenshot = pyautogui.screenshot()
         curr_img = np.array(curr_screenshot.convert('L'))
         curr_results = reader.readtext(curr_img)
@@ -401,51 +1001,42 @@ def screen_assistant(user_intent):
         try:
             response = client.chat.completions.create(
                 model="gpt-4o",
-                messages=[{"role": "system", "content": "妳是精密自動化助理，負責計算內容並回傳 JSON。"},
-                          {"role": "user", "content": decision_prompt}],
-                response_format={ "type": "json_object" }
+                messages=[
+                    {"role": "system", "content": "妳是精密自動化助理，負責計算內容並回傳 JSON。"},
+                    {"role": "user", "content": decision_prompt}
+                ],
+                response_format={"type": "json_object"}
             )
             data = json.loads(response.choices[0].message.content)
             
             idx = data.get("line_idx")
-            # 移除可能誤加的括號
             final_content = data.get("content", "").strip().lstrip('[').rstrip(']')
 
             if idx is not None and idx < len(curr_filtered):
                 bbox = curr_filtered[idx][0]
                 original_text = curr_filtered[idx][1]
-                real_len = len(original_text) # 計算物理退格次數
+                real_len = len(original_text)
 
-                # 定位到末端
+                # 定位並點擊
                 target_x = int(bbox[1][0])
                 target_y = int((bbox[1][1] + bbox[2][1]) / 2)
-                
-                # 移動與執行
                 pyautogui.click(target_x, target_y)
                 time.sleep(0.3)
 
+                # 決定是否要刪除原文字
                 should_delete = t_act in ['delete', 'optimize', 'translate', 'debug', 'replace'] or '翻譯' in user_intent
-
                 if should_delete:
-                    print(f"[執行] 精確物理退格：偵測到「{original_text}」，共 {real_len} 個字元")
+                    print(f"[執行] 精確物理退格：{real_len} 個字元")
                     for _ in range(real_len):
                         pyautogui.press('backspace')
-                        # 稍微給一點延遲，讓系統反應，防止刪太快漏字
-                        # time.sleep(0.01) 
-                
-                # 只有非純「生成」任務才刪除原文字 (生成不刪除，翻譯/更改要刪除)
-                if t_act in ['delete', 'optimize', 'translate', 'debug', 'replace']:
-                    print(f"[執行] 退格刪除 {real_len} 個字元...")
-                    for _ in range(real_len):
-                        pyautogui.press('backspace')
-                
+
                 # 貼上新內容
                 if final_content:
                     pyperclip.copy(final_content)
                     pyautogui.hotkey('ctrl', 'v')
                 
                 print(f"[完成] ID {idx}：{data.get('reason')}")
-                time.sleep(1.2) # 介面穩定緩衝
+                time.sleep(1.2)
             else:
                 print("[跳過] 無法定位匹配的 ID。")
                 break
@@ -455,76 +1046,52 @@ def screen_assistant(user_intent):
 
     return f"拉菲爾：已完成「{t_act}」任務，處理點共計 {task_count} 處。"
 
+player = None
+
 def music_controller(args):
-    """
-    處理點歌與多媒體控制邏輯
-    args: 直接接收來自 AI 的工具參數字典
-    """
-    # 從傳入的字典直接抓取欄位
+    global player
     action = args.get('action')
-    target = args.get('song_name')
-    platform = args.get('platform', 'youtube')
-    lang = args.get('language', 'auto')
+    song_name = args.get('song_name', '')
+
+    if action == 'play' and song_name:
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'format': 'bestaudio'}) as ydl:
+                info = ydl.extract_info(f"ytsearch:{song_name}", download=False)
+                url = info['entries'][0]['url'] if 'entries' in info else info['url']
+
+            if player is None:
+                player = vlc.MediaPlayer()
+            else:
+                player.stop()
+
+            player.set_media(vlc.Media(url))
+            player.play()
+            return f"正在為您播放：{info['entries'][0]['title'] if 'entries' in info else info['title']}"
+        except Exception as e:
+            return f"播放失敗：{e}"
+
+    elif action in ['stop', 'next', 'previous']:
+        if player:
+            if action == 'stop': player.stop()
+            elif action == 'next': player.stop()  # 可再擴充
+        return f"已執行 {action}"
     
-    if action == 'play' and target:
-        import webbrowser
-        import urllib.parse
-        
-        query = urllib.parse.quote(f"{target} {lang if lang != 'auto' else ''}")
-        
-        if platform == 'youtube':
-            url = f"https://www.youtube.com/results?search_query={query}"
-        else:
-            # 也可以擴充其他平台的 URL
-            url = f"https://www.google.com/search?q={target}+music"
-            
-        print(f"[音樂助手] 語系:{lang} | 平台:{platform} | 搜尋：{target}")
-        webbrowser.open(url)
-        return f"好的，正在為您在 {platform} 搜尋並播放 {target}。"
-    
-    elif action == 'next':
-        pyautogui.press('medianexttrack')
-        return "切換至下一首。"
-    
-    # ... 其他動作 (stop, volume_up 等) ...
-    return "已執行音樂控制指令。"
+    return "音樂控制已執行。"
 
 def toggle_subtitles(action):
-    """控制字幕顯示開關"""
     if action == "on":
         subtitle_win.is_enabled = True
-        return "好的，已為您開啟字幕顯示。"
+        return "字幕已開啟。"
     elif action == "off":
         subtitle_win.is_enabled = False
-        subtitle_win.hide() # 立即隱藏目前顯示中的字幕
-        return "沒問題，我會把字幕隱藏起來。"
-    return "無效的字幕指令。"
+        subtitle_win.hide()
+        return "字幕已關閉。"
+    return "無效指令。"
 
 def shutdown_raphael():
-    print("[系統] 準備執行自我關閉...")
-    return "好的，系統即將關閉。期待下次與您見面，祝您生活愉快，再見。"
-    
-# --- 4. 工具描述 ---
-tools = [
-    {"type": "function", "function": {"name": "get_system_status", "description": "問系統狀況"}},
-    {"type": "function", "function": {"name": "get_current_time", "description": "問時間"}},
-    {"type": "function", "function": {"name": "get_weather", "description": "查天氣", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}},
-    {"type": "function", "function": {"name": "control_computer", "description": "電腦控制", "parameters": {"type": "object", "properties": {"action": {"type": "string"}}}}},
-    {"type": "function", "function": {"name": "open_software", "description": "開軟體", "parameters": {"type": "object", "properties": {"app_name": {"type": "string"}}}}},
-    {"type": "function", "function": {"name": "vision_click","description": "點擊『沒有文字』的圖標、圖案或顏色按鈕（如：紅色的圓按鈕、Chrome 圖示）。","parameters": {"type": "object",  "properties": { "target_description": {"type": "string","description": "圖標的描述"}},"required": ["target_description"]}}},
-    {"type": "function", "function": {"name": "text_click","description": "點擊『帶有文字』的按鈕、選單或連結（如：『我的電腦』、網頁上的『新聞』）。","parameters": {"type": "object","properties": {"target_text": {"type": "string","description": "按鈕上的文字內容"}},"required": ["target_text"]}}},
-    {"type": "function", "function": {"name": "set_timer", "description": "當使用者要求在一段時間後提醒時必須呼叫此工具。禁止直接用對話回覆時間到了。須抓取seconds(秒數)與label(標籤)。", "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "description": "延遲總秒數"}, "label": {"type": "string", "description": "提醒內容"}}, "required": ["seconds", "label"]}}},
-    {"type": "function", "function": {"name": "web_search", "description": "當使用者要求搜尋資訊、查詢網路、或是詢問拉菲爾不知道的最新消息時使用。", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "搜尋關鍵字"}}, "required": ["query"]}}},
-    {"type": "function","function": {"name": "screen_assistant","description": "全能畫面助手。處理畫面上所有文字或程式碼的生成、刪除、優化、翻譯、除錯。AI 會自動判斷對象類型與執行多次檢查。","parameters": {"type": "object","properties": {"user_intent": {"type": "string", "description": "使用者的原始需求內容"}},"required": ["user_intent"]}}},
-    {"type": "function","function": {"name": "music_controller","description": "點歌與多媒體控制助手。負責搜尋歌曲、播放音樂、切換曲目及調整音量。支援 YouTube Music、Spotify 或系統媒體控制。","parameters": {"type": "object","properties": {"action": {"type": "string","enum": ["play", "stop", "next", "previous", "volume_up", "volume_down"],"description": "要執行的音樂操作動作，例如播放、停止、下一首。"},"song_name": {"type": "string","description": "想要播放的歌名或歌手關鍵字，例如：'周杰倫 告白氣球'。"},"platform": {"type": "string","enum": ["youtube", "spotify", "system"],"description": "指定的播放平台，預設為 youtube。"},"language": {"type": "string","description": "歌曲的語系，用於精準搜尋。例如：'日文', '英文'。"}},"required": ["action"]}}},
-    {"type": "function","function": {"name": "toggle_subtitles","description": "開啟或關閉桌面字幕顯示。","parameters": {"type": "object","properties": {"action": {"type": "string", "enum": ["on", "off"], "description": "on 代表開啟，off 代表關閉"}},"required": ["action"]}}},
-    {"type": "function","function": {"name": "shutdown_raphael","description": "當使用者要求關閉程式、退出、關閉拉菲爾、或說再見並要求關閉時使用。"}},
-]
+    return "系統即將關閉，再見！"
 
-chat_history = [{"role": "system", "content": "你是拉菲爾。當使用者要求對畫面代碼除錯、優化或生成時，請使用 code_assistant。"}]
-
-sub_signal = SubtitleSignal()
-
+# ==================== 語音相關 ====================
 async def speak(text):
     print(f"拉菲爾：{text}")
     sub_signal.text_updated.emit(text)
@@ -534,30 +1101,23 @@ async def speak(text):
         pygame.mixer.music.load("res.mp3")
         pygame.mixer.music.play()
         while pygame.mixer.music.get_busy(): await asyncio.sleep(0.1)
-    except: pass
+    except Exception as e:
+        print(f"語音播放失敗: {e}")
 
-async def get_voice_input(recorder, timeout_seconds=5):
-    """
-    修正版：使用 await 呼叫 speak，避免 event loop 衝突
-    """
-    print(f"\n[拉菲爾聆聽中...] (緩衝時間: {timeout_seconds}秒)")
-    
+async def get_voice_input(recorder, timeout_seconds=8):
+    print(f"[聆聽中...] 等待 {timeout_seconds} 秒")
     start_time = time.time()
     audio_data = []
-    
     while (time.time() - start_time) < timeout_seconds:
         frame = recorder.read()
         audio_data.extend(frame)
-        
         if len(audio_data) >= 1600:
             rms = math.sqrt(sum(s**2 for s in audio_data[-1600:]) / 1600)
-            
-            if rms > 450:
-                print("[偵測到指令，處理中...]")
+            if rms > 300:
+                print("[偵測到聲音]")
                 play_sound("reply_notify.mp3")
                 while len(audio_data) < 110 * recorder.frame_length:
                     audio_data.extend(recorder.read())
-                
                 with wave.open("req.wav", 'wb') as wf:
                     wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
                     wf.writeframes(struct.pack('<' + ('h' * len(audio_data)), *audio_data))
@@ -565,98 +1125,80 @@ async def get_voice_input(recorder, timeout_seconds=5):
                     with open("req.wav", "rb") as f:
                         return client.audio.transcriptions.create(model="whisper-1", file=f).text.strip()
                 except: return ""
-    
-    # 超時未聽到聲音
-    print("[逾時] 未偵測到指令。")
+    print("[逾時]")
+    await speak("未聽到指令。")
     play_sound("Stop_listen_notify.mp3")
-    
-    # 修正處：直接 await，不要用 asyncio.run
-    await speak("未聽到指令。") 
     return ""
 
-def run_async_main():
-    """在獨立線程中運行原本的監聽邏輯"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(main())
-
 async def main():
-    porcupine = pvporcupine.create(access_key=PICO_KEY, keyword_paths=[PPN_PATH], sensitivities=[0.95])
-    recorder = PvRecorder(device_index=DEVICE_INDEX, frame_length=porcupine.frame_length)
-    print(f"\n--- 拉菲爾系統啟動 (包含聆聽提示詞) ---")
-    
-    recorder.start()
-    try:
-        while True:
-            if porcupine.process(recorder.read()) >= 0:
+    global control_panel
+
+    print("\n=== Raphael 待命中... ===\n")
+
+    while True:
+        try:
+            if not control_panel.recorder:
+                print("[錯誤] recorder 未初始化，等待 1 秒...")
+                await asyncio.sleep(1.0)
+                continue
+
+            frame = control_panel.recorder.read()
+            if not frame or len(frame) == 0:
+                await asyncio.sleep(0.01)
+                continue
+
+            triggered = False
+
+            if control_panel.porcupine is not None:
+                keyword_index = control_panel.porcupine.process(frame)
+                if keyword_index >= 0:
+                    print(f"[喚醒成功] index={keyword_index} @ {datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
+                    triggered = True
+            else:
+                audio_np = np.array(frame, dtype=np.float32)
+                rms = np.sqrt(np.mean(audio_np ** 2))
+                if rms > 300:
+                    print(f"[音量觸發] RMS = {rms:.1f} @ {datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
+                    triggered = True
+
+            # RMS 顯示
+            audio_np = np.array(frame, dtype=np.float32)
+            rms = np.sqrt(np.mean(audio_np ** 2)) if len(audio_np) > 0 else 0.0
+            control_panel.rms_updated.emit(rms)
+
+            if triggered:
+                print("=== 觸發成功，開始錄音 ===")
                 play_sound("notify.mp3")
-                user_text = await get_voice_input(recorder)
-                if not user_text: continue 
-                print(f"你說：{user_text}")
-                play_sound("reply_notify.mp3") 
-                print("[處理中]")
-                chat_history.append({"role": "user", "content": user_text})
-                comp = client.chat.completions.create(model="gpt-4o-mini", messages=chat_history, tools=tools)
-                msg = comp.choices[0].message
-                if msg.tool_calls:
-                    chat_history.append(msg)
+                await speak("我在，請說～")
+                user_text = await get_voice_input(control_panel.recorder, timeout_seconds=8)
+                print("[觸發時間]", datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3])
 
-                    for tc in msg.tool_calls:
-                        fn, args = tc.function.name, json.loads(tc.function.arguments)
-                        res = ""
+                if user_text and user_text.strip():
+                    print(f"→ 使用者說：{user_text}")
+                    await control_panel.process_ai_logic(user_text)
+                else:
+                    print("[無有效語音輸入]")
 
-                        if fn == "set_timer":
-                            u_sec, u_lab = args.get("seconds"), args.get("label")
-                            asyncio.create_task(set_timer(u_sec, u_lab))
-                            chat_history.append({"role": "tool", "tool_call_id": tc.id, "name": fn, "content": "timer_set"})
-                            ans = f"沒問題，我已經設定好在 {u_sec} 秒後提醒您「{u_lab}」。"
-                            await speak(ans)
-                            break
-                        
-                        if fn == "get_current_time": res = get_current_time()
-                        elif fn == "music_controller": res = music_controller(args)
-                        elif fn == "web_search": res = web_search(args.get("query"))
-                        elif fn == "get_weather": res = get_weather(args.get("city"))
-                        elif fn == "control_computer": res = control_computer(args.get("action"))
-                        elif fn == "screen_assistant": res = screen_assistant(user_intent=args.get("user_intent"))
-                        elif fn == "open_software": res = open_software(args.get("app_name"))
-                        elif fn == "vision_click": res = vision_click(args.get("target_description"))
-                        elif fn == "text_click": res = text_click(args.get("target_text"))
-                        elif fn == "get_system_status": res = get_system_status()
-                        elif fn == "toggle_subtitles": res = toggle_subtitles(args.get("action"))
-                        elif fn == "shutdown_raphael":
-                            res = shutdown_raphael()
-                            await speak(res) 
-                            if pygame.mixer.get_init():
-                                while pygame.mixer.music.get_busy():
-                                    await asyncio.sleep(0.1)
-                            print("[系統] 語音播放結束，清理資源中...")
-                            pygame.mixer.music.stop()
-                            pygame.mixer.quit()
-                            await asyncio.sleep(0.5)
-                            os._exit(0)
-
-                        chat_history.append({"role": "tool", "tool_call_id": tc.id, "name": fn, "content": res})
-                    
-                    final_comp = client.chat.completions.create(model="gpt-4o-mini", messages=chat_history)
-                    ans = final_comp.choices[0].message.content
-                else: ans = msg.content 
-                chat_history.append({"role": "assistant", "content": ans})
-                await speak(ans)
-    finally:
-        recorder.stop(); recorder.delete(); porcupine.delete()
+        except Exception as e:
+            print(f"[主迴圈異常] {e}")
+            await asyncio.sleep(0.1)
 
 if __name__ == "__main__":
-    # asyncio.run(main())
-    try:
-        pygame.mixer.init()
-    except:
-        pass
-
     app = QApplication(sys.argv)
-    
     subtitle_win = RaphaelSubtitleWindow()
+    global control_panel
+    control_panel = RaphaelControlCenter(subtitle_win)
+    control_panel.show()
+
     sub_signal.text_updated.connect(subtitle_win.display_text)
-    logic_thread = threading.Thread(target=run_async_main, daemon=True)
-    logic_thread.start()
+    sub_signal.text_updated.connect(
+        lambda t: (
+            control_panel.chat_history.append(f"<b style='color:#82AAFF;'>拉菲爾：</b> {t}"),
+            QTimer.singleShot(50, lambda: control_panel.chat_history.verticalScrollBar().setValue(
+                control_panel.chat_history.verticalScrollBar().maximum()
+            ))
+        )
+    )
+
+    threading.Thread(target=lambda: asyncio.run(main()), daemon=True).start()
     sys.exit(app.exec_())
